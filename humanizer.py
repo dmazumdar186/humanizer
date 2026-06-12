@@ -22,11 +22,15 @@ outputs:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
 import re
 import sys
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Fix Unicode crash on Windows cp1252 before any other output
@@ -642,6 +646,237 @@ def _show_diff(original: str, humanized: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Batch mode helpers
+# ---------------------------------------------------------------------------
+
+def humanize_one(
+    row_index: int,
+    text_id: str,
+    text: str,
+    voice_name: str,
+    platform: str,
+    max_length: int | None,
+    keep_em_dashes: bool,
+    tier: str,
+    dry_run: bool,
+) -> dict:
+    """
+    Humanize a single CSV row. Returns a result dict with keys:
+        text_id, original, humanized, tier, cost_usd, error
+    Never raises — all exceptions are captured into the 'error' field.
+    """
+    result: dict = {
+        "text_id": text_id,
+        "original": text,
+        "humanized": "",
+        "tier": tier,
+        "cost_usd": "",
+        "error": "",
+    }
+
+    try:
+        if not text.strip():
+            result["error"] = "empty text — skipped"
+            return result
+
+        # Truncate if needed (same cap as single-input path)
+        working_text = text
+        if len(working_text) > MAX_INPUT_CHARS:
+            log.warning(
+                "[batch row %s] Input truncated from %d to %d chars",
+                text_id, len(working_text), MAX_INPUT_CHARS,
+            )
+            working_text = working_text[:MAX_INPUT_CHARS]
+
+        voice = load_voice(voice_name)
+        pre_cleaned, flags = _rules_pre_pass(working_text, voice, keep_em_dashes=keep_em_dashes)
+
+        # R10-2 guard: pre-pass must not eat everything
+        if not pre_cleaned.strip() and working_text.strip():
+            log.warning(
+                "[batch row %s] Pre-pass stripped entire input; falling back to original.",
+                text_id,
+            )
+            pre_cleaned = working_text
+
+        system_prompt, user_prompt = _build_humanize_prompt(
+            pre_cleaned, voice, flags, platform
+        )
+
+        # Estimate cost for dry-run and capture it
+        if dry_run:
+            estimated_input_tokens = (len(system_prompt) + len(user_prompt)) // 4 + 200
+            prices = _TIER_COST_PER_M.get(tier, {"input": 5.0, "output": 25.0})
+            estimated_cost = (
+                estimated_input_tokens * prices["input"] + 200 * prices["output"]
+            ) / 1_000_000
+            result["cost_usd"] = f"{estimated_cost:.6f}"
+            result["humanized"] = "[DRY-RUN: LLM call skipped]"
+            return result
+
+        humanized = _call_llm_humanize(system_prompt, user_prompt, tier, dry_run=False)
+
+        max_len = max_length
+        if platform == "tweet" and max_len is None:
+            max_len = 280
+        humanized = _platform_post_process(humanized, platform, max_len)
+
+        result["humanized"] = humanized
+        # cost_usd not available per-row without intercepting _call_llm_humanize's log;
+        # leave blank unless dry_run (dry_run path above fills it)
+        result["cost_usd"] = ""
+
+    except SystemExit as exc:
+        # SystemExit from load_voice / provider detection — capture message, don't propagate
+        result["error"] = f"SystemExit: {exc}"
+        log.error("[batch row %s] fatal: %s", text_id, exc)
+    except Exception as exc:  # noqa: BLE001
+        # Per-row failure isolation: capture any other exception + traceback
+        result["error"] = f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=5)}"
+        log.error("[batch row %s] error: %s: %s", text_id, type(exc).__name__, exc)
+
+    return result
+
+
+def run_batch(
+    input_path: Path,
+    output_path: Path,
+    voice_name: str,
+    platform: str,
+    max_length: int | None,
+    keep_em_dashes: bool,
+    tier: str,
+    dry_run: bool,
+    max_workers: int = 4,
+) -> int:
+    """
+    Fan-out batch humanization from a CSV file.
+
+    Input CSV columns: text_id, text_to_humanize[, voice_name]
+    Output CSV columns: text_id, original, humanized, tier, cost_usd, error
+
+    Returns 0 on success (even if some rows failed — per-row failures are
+    isolated and reported in the output CSV 'error' column).
+    """
+    if not input_path.exists():
+        log.error("Batch input file not found: %s", input_path)
+        return 1
+
+    # Read all rows first
+    rows: list[dict] = []
+    try:
+        with input_path.open(encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames is None or "text_to_humanize" not in (reader.fieldnames or []):
+                log.error(
+                    "Batch CSV must have a 'text_to_humanize' column. "
+                    "Found columns: %s", reader.fieldnames
+                )
+                return 1
+            for i, row in enumerate(reader):
+                rows.append({
+                    "index": i,
+                    "text_id": row.get("text_id", str(i)),
+                    "text": row.get("text_to_humanize", ""),
+                    # per-row voice override: fall back to CLI default
+                    "voice": row.get("voice_name", voice_name) or voice_name,
+                })
+    except Exception as exc:  # noqa: BLE001
+        log.error("Failed to read batch input CSV: %s", exc)
+        return 1
+
+    if not rows:
+        log.warning("Batch input CSV is empty — nothing to do.")
+        return 0
+
+    log.info("BATCH: %d rows | max_workers=%d | tier=%s | platform=%s",
+             len(rows), max_workers, tier, platform)
+
+    # Thread-safe output collection
+    results: list[dict | None] = [None] * len(rows)
+    results_lock = threading.Lock()
+
+    def _worker(row: dict) -> None:
+        result = humanize_one(
+            row_index=row["index"],
+            text_id=row["text_id"],
+            text=row["text"],
+            voice_name=row["voice"],
+            platform=platform,
+            max_length=max_length,
+            keep_em_dashes=keep_em_dashes,
+            tier=tier,
+            dry_run=dry_run,
+        )
+        # Lock write to shared list (workspace hardening rule 2)
+        with results_lock:
+            results[row["index"]] = result
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_worker, row): row for row in rows}
+        for future in as_completed(futures):
+            exc = future.exception()
+            if exc is not None:
+                # Worker itself must not raise (humanize_one captures all exceptions).
+                # If it does raise, log it — don't crash the entire batch.
+                row = futures[future]
+                log.error("[batch row %s] Unexpected worker exception: %s", row["text_id"], exc)
+                with results_lock:
+                    if results[row["index"]] is None:
+                        results[row["index"]] = {
+                            "text_id": row["text_id"],
+                            "original": row["text"],
+                            "humanized": "",
+                            "tier": tier,
+                            "cost_usd": "",
+                            "error": f"WorkerCrash: {exc}",
+                        }
+
+    # Replace any still-None slots (defensive)
+    for i, r in enumerate(results):
+        if r is None:
+            results[i] = {
+                "text_id": rows[i]["text_id"],
+                "original": rows[i]["text"],
+                "humanized": "",
+                "tier": tier,
+                "cost_usd": "",
+                "error": "UnknownError: result slot never filled",
+            }
+
+    # Write output CSV
+    fieldnames = ["text_id", "original", "humanized", "tier", "cost_usd", "error"]
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        log.error("Failed to write batch output CSV: %s", exc)
+        return 1
+
+    # Summary
+    succeeded = sum(1 for r in results if r and not r["error"])  # type: ignore[union-attr]
+    failed = len(results) - succeeded
+    total_cost = 0.0
+    for r in results:
+        if r and r.get("cost_usd"):  # type: ignore[union-attr]
+            try:
+                total_cost += float(r["cost_usd"])  # type: ignore[index]
+            except (ValueError, TypeError):
+                pass
+
+    cost_str = f"${total_cost:.5f}" if total_cost > 0 else "n/a (live runs; see logs)"
+    print(
+        f"BATCH SUMMARY: {len(results)} total, {succeeded} succeeded, "
+        f"{failed} failed, {cost_str} total cost"
+    )
+    log.info("Batch output written to: %s", output_path)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -653,6 +888,15 @@ def _build_parser() -> argparse.ArgumentParser:
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--text", metavar="TEXT", help="Direct text input -> humanize this string")
     input_group.add_argument("--file", metavar="PATH", help="Path to a file to humanize -> reads the file")
+    input_group.add_argument(
+        "--batch", metavar="CSV",
+        help=(
+            "Batch mode: path to input CSV with columns "
+            "'text_id, text_to_humanize[, voice_name]'. "
+            "Fans out humanization across --max-workers threads. "
+            "Output CSV written to --out (default: humanized_<input>.csv)."
+        ),
+    )
 
     parser.add_argument("--voice", default=DEFAULT_VOICE, help=f"Voice profile name (default: {DEFAULT_VOICE})")
     parser.add_argument(
@@ -675,6 +919,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Skip LLM call -> show pre-pass output and cost estimate")
+    parser.add_argument(
+        "--max-workers", type=int, default=4, metavar="N",
+        help="Batch mode: number of parallel worker threads (default: 4)",
+    )
+    parser.add_argument(
+        "--out", metavar="PATH", default=None,
+        help="Batch mode: output CSV path (default: humanized_<input-stem>.csv beside the input file)",
+    )
     return parser
 
 
@@ -685,6 +937,29 @@ def main() -> int:
     # Fix 3: validate --max-length
     if args.max_length is not None and args.max_length < 1:
         parser.error("--max-length must be a positive integer >= 1")
+
+    # ---------------------------------------------------------------------------
+    # Batch mode path
+    # ---------------------------------------------------------------------------
+    if args.batch is not None:
+        if args.max_workers < 1:
+            parser.error("--max-workers must be >= 1")
+        input_path = Path(args.batch)
+        if args.out is not None:
+            output_path = Path(args.out)
+        else:
+            output_path = input_path.parent / f"humanized_{input_path.stem}.csv"
+        return run_batch(
+            input_path=input_path,
+            output_path=output_path,
+            voice_name=args.voice,
+            platform=args.platform,
+            max_length=args.max_length,
+            keep_em_dashes=args.keep_em_dashes,
+            tier=args.tier,
+            dry_run=args.dry_run,
+            max_workers=args.max_workers,
+        )
 
     # ---------------------------------------------------------------------------
     # Read input text
