@@ -138,9 +138,11 @@ def _to_anthropic_tool_format(schema: dict) -> dict:
 # Tier pricing for cost estimation — separate input/output prices (USD per million tokens)
 # ---------------------------------------------------------------------------
 _TIER_COST_PER_M = {
-    "default":  {"input": 3.0,  "output": 15.0},   # Sonnet-class
-    "premium":  {"input": 5.0,  "output": 25.0},   # Opus-class
-    "gemini":   {"input": 0.0,  "output": 0.0},    # Free tier
+    # USD per million tokens. cache_read = 0.1× input, cache_write = 1.25× input
+    # (Anthropic published ratios — workspace python-hardening rule 4).
+    "default":  {"input": 3.0,  "cache_read": 0.30, "cache_write": 3.75,  "output": 15.0},   # Sonnet-class
+    "premium":  {"input": 5.0,  "cache_read": 0.50, "cache_write": 6.25,  "output": 25.0},   # Opus-class
+    "gemini":   {"input": 0.0,  "cache_read": 0.0,  "cache_write": 0.0,   "output": 0.0},    # Free tier
 }
 
 
@@ -402,15 +404,23 @@ def _call_llm_humanize(
                 msg = "[redacted credentials]"
             raise SystemExit(f"OpenRouter API call failed: {msg[:200]}")
 
-        # Fix 10: separate input/output pricing
+        # Fix 10: separate input/output pricing (OpenRouter: prompt_tokens/completion_tokens;
+        # no cache fields exposed — cache_read/cache_write default to 0 safely)
         if response.usage:
             in_tok = response.usage.prompt_tokens or 0
             out_tok = response.usage.completion_tokens or 0
-            prices = _TIER_COST_PER_M.get(tier, {"input": 5.0, "output": 25.0})
-            cost = (in_tok * prices["input"] + out_tok * prices["output"]) / 1_000_000
+            cr_tok = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cw_tok = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            prices = _TIER_COST_PER_M.get(tier, {"input": 5.0, "cache_read": 0.5, "cache_write": 6.25, "output": 25.0})
+            cost = (
+                in_tok * prices["input"]
+                + cr_tok * prices.get("cache_read", 0)
+                + cw_tok * prices.get("cache_write", 0)
+                + out_tok * prices["output"]
+            ) / 1_000_000
             log.info(
-                "Tokens: %d in + %d out = %d total | Est. cost: $%.5f",
-                in_tok, out_tok, in_tok + out_tok, cost,
+                "Tokens: %d in + %d out (cr=%d cw=%d) = %d total | Est. cost: $%.5f",
+                in_tok, out_tok, cr_tok, cw_tok, in_tok + out_tok, cost,
             )
 
         # Parse tool call — Fix 1: wrap JSON parse
@@ -462,16 +472,24 @@ def _call_llm_humanize(
                 msg = "[redacted credentials]"
             raise SystemExit(f"Anthropic API call failed: {msg[:200]}")
 
-        # Fix 10: separate input/output pricing (Anthropic SDK: input_tokens/output_tokens)
+        # Fix 10: separate input/output pricing (Anthropic SDK: input_tokens/output_tokens +
+        # cache_read_input_tokens/cache_creation_input_tokens for prompt caching — rule 4)
         usage = response.usage
         if usage:
             in_tok = getattr(usage, "input_tokens", 0) or 0
             out_tok = getattr(usage, "output_tokens", 0) or 0
-            prices = _TIER_COST_PER_M.get(tier, {"input": 5.0, "output": 25.0})
-            cost = (in_tok * prices["input"] + out_tok * prices["output"]) / 1_000_000
+            cr_tok = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cw_tok = getattr(usage, "cache_creation_input_tokens", 0) or 0
+            prices = _TIER_COST_PER_M.get(tier, {"input": 5.0, "cache_read": 0.5, "cache_write": 6.25, "output": 25.0})
+            cost = (
+                in_tok * prices["input"]
+                + cr_tok * prices.get("cache_read", 0)
+                + cw_tok * prices.get("cache_write", 0)
+                + out_tok * prices["output"]
+            ) / 1_000_000
             log.info(
-                "Tokens: %d in + %d out = %d total | Est. cost: $%.5f",
-                in_tok, out_tok, in_tok + out_tok, cost,
+                "Tokens: %d in + %d out (cr=%d cw=%d) = %d total | Est. cost: $%.5f",
+                in_tok, out_tok, cr_tok, cw_tok, in_tok + out_tok, cost,
             )
 
         # Parse tool use block — Fix 1: tool_call JSON handled via block.input (dict, no JSON parse needed)

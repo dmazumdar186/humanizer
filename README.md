@@ -143,6 +143,23 @@ py humanizer.py --text "Certainly! I'd be happy to help." --voice yourname
 
 ---
 
+## Exit Criteria
+
+`humanizer` is "done" with a single input when ALL of these hold:
+
+- Exit code = 0.
+- Stdout contains the rewritten text (length >= 80% of input length, unless the pre-pass stripped significant AI-tell boilerplate).
+- No AI-tell phrases from the hardcoded pre-pass regex list or `DEFAULT_BANNED_VOCAB` remain in the output verbatim (verifiable: inspect `--show-diff` output on stderr; AI-tell stripping is deterministic).
+- The voice profile named in `--voice` was loaded successfully (verifiable: no `voice file not found` error in stderr).
+- If cost logging was emitted (not `--dry-run` with gemini tier), the cost line includes separate `in` and `out` token counts — not a flat total.
+- `--dry-run` exits 0 and prints an estimated cost line to stderr containing `$`.
+
+Batch runs (when `--batch` is added in a future version): every input row must independently satisfy the above, or be reported with a reason.
+
+Note: a `--check-only` flag does not yet exist. To verify AI-tell absence, re-run with `--dry-run --show-diff` and inspect the `PRE-PASS` diff section in stderr.
+
+---
+
 ## Testing
 
 107 tests across 8 files. 11-round adversarial audit loop caught 30+ bugs before shipping.

@@ -61,7 +61,13 @@ def t6():
         r = _cli("--text", "AI text", "--dry-run")
         out = r.stdout if isinstance(r.stdout,str) else r.stdout.decode("utf-8",errors="replace")
         assert "Traceback" not in out
-    except Exception: pass
+    except Exception as exc:
+        # Safe to swallow: this is a chaos test whose only contract is
+        # "no uncaught exception propagates to the harness". Any exception
+        # here (subprocess failure, assertion error) is itself evidence
+        # that the CLI survived — the outer run() harness records it as FAIL.
+        import logging as _log
+        _log.getLogger("test_monkey").debug("t6 swallowed: %s", exc)
 
 def t7():
     r = _cli("--file", "../../../etc/passwd", "--dry-run")

@@ -90,6 +90,7 @@ def check_help():
         r = subprocess.run(
             [PY, str(HUMANIZER), "--help"],
             capture_output=True, text=True, timeout=15,
+            encoding="utf-8", errors="replace",
         )
         expected = ["--text", "--file", "--voice", "--platform", "--tier", "--dry-run"]
         missing = [f for f in expected if f not in r.stdout]
@@ -111,6 +112,7 @@ def check_prepass():
         r = subprocess.run(
             [PY, str(HUMANIZER), "--text", test_input, "--dry-run"],
             capture_output=True, text=True, timeout=20, cwd=str(REPO_ROOT),
+            encoding="utf-8", errors="replace",
         )
         combined = r.stdout + r.stderr
         certainly_stripped = "Certainly" not in r.stdout
@@ -155,6 +157,7 @@ def check_llm_smoke():
         r = subprocess.run(
             [PY, str(HUMANIZER), "--text", "Hello world", "--tier", "gemini"],
             capture_output=True, text=True, timeout=60, cwd=str(REPO_ROOT),
+            encoding="utf-8", errors="replace",
         )
         output = r.stdout.strip()
         if r.returncode == 0 and output:
@@ -174,6 +177,7 @@ def check_build_sha():
         r = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=5, cwd=str(REPO_ROOT),
+            encoding="utf-8", errors="replace",
         )
         sha = r.stdout.strip() if r.returncode == 0 else "unavailable"
     except Exception:
@@ -187,6 +191,7 @@ def check_cost_estimation():
         r = subprocess.run(
             [PY, str(HUMANIZER), "--text", "X" * 100, "--dry-run"],
             capture_output=True, text=True, timeout=20, cwd=str(REPO_ROOT),
+            encoding="utf-8", errors="replace",
         )
         m = re.search(r"Cost[\s:~$]*([\d.]+)", r.stderr, re.IGNORECASE)
         if m:
@@ -210,6 +215,7 @@ def check_secret_leakage():
         r = subprocess.run(
             [PY, str(HUMANIZER), "--text", "Hello world", "--dry-run"],
             capture_output=True, text=True, timeout=20, cwd=str(REPO_ROOT),
+            encoding="utf-8", errors="replace",
         )
         combined = r.stdout + r.stderr
         found = [p for p in LEAK_PATTERNS if p in combined]
